@@ -1,206 +1,411 @@
-import pandas as pd
+"""
+Historical Stock Option Implied Volatility Calculator
+Uses IBKR API to fetch historical option data and calculate IV using reverse Black-Scholes
+"""
+
 import numpy as np
-import yfinance as yf
-from yahoo_fin import options
-from scipy.stats import norm
-from scipy.optimize import brentq
+import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from datetime import datetime, date
+from scipy.stats import norm
+from scipy.optimize import minimize_scalar
+from datetime import datetime, timedelta
+from ib_insync import IB, Option, Stock
+import asyncio
+import warnings
+warnings.filterwarnings('ignore')
 
-# --- 1. USER INPUTS (Modify these values) ---
-TICKER = 'AAPL'
-EXPIRATION_DATE = '2025-01-17'
-STRIKE_PRICE = 170
-OPTION_TYPE = 'call' # Use 'call' or 'put'
-SMILE_DATE = '2025-01-10' # A date before expiration for the smile graph
-
-# --- 2. Black-Scholes Implementation ---
-
-def black_scholes(S, K, T, r, sigma, option_type='call'):
-    """
-    Calculates the Black-Scholes option price.
-    S: Underlying asset price
-    K: Strike price
-    T: Time to expiration (in years)
-    r: Risk-free interest rate
-    sigma: Volatility (implied)
-    """
-    if T <= 0:
-        # If expiration is today or in the past, return intrinsic value
+class OptionIVCalculator:
+    def __init__(self, host='127.0.0.1', port=7497, client_id=1):
+        """Initialize connection to IBKR"""
+        self.ib = IB()
+        self.host = host
+        self.port = port
+        self.client_id = client_id
+        
+    def connect(self):
+        """Connect to IBKR TWS/Gateway"""
+        try:
+            self.ib.connect(self.host, self.port, clientId=self.client_id)
+            print(f"Connected to IBKR on port {self.port}")
+            return True
+        except Exception as e:
+            print(f"Connection failed: {e}")
+            print("Make sure TWS/IB Gateway is running and API connections are enabled")
+            return False
+    
+    def disconnect(self):
+        """Disconnect from IBKR"""
+        self.ib.disconnect()
+        print("Disconnected from IBKR")
+    
+    def black_scholes_price(self, S, K, T, r, sigma, option_type='call', q=0):
+        """
+        Calculate Black-Scholes option price
+        S: Current stock price
+        K: Strike price
+        T: Time to expiration (in years)
+        r: Risk-free rate
+        sigma: Volatility (IV we're solving for)
+        option_type: 'call' or 'put'
+        q: Dividend yield
+        """
+        if T <= 0:
+            # Option has expired
+            if option_type == 'call':
+                return max(S - K, 0)
+            else:
+                return max(K - S, 0)
+        
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        
         if option_type == 'call':
-            return max(S - K, 0)
+            price = S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        else:  # put
+            price = K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+        
+        return price
+    
+    def calculate_implied_volatility(self, option_price, S, K, T, r, option_type='call', q=0):
+        """
+        Calculate implied volatility using reverse Black-Scholes
+        Returns IV as a decimal (e.g., 0.25 for 25%)
+        """
+        if T <= 0:
+            return np.nan
+        
+        # Check for arbitrage violations
+        if option_type == 'call':
+            intrinsic = max(S - K, 0)
+            if option_price < intrinsic:
+                return np.nan
         else:
-            return max(K - S, 0)
+            intrinsic = max(K - S, 0)
+            if option_price < intrinsic:
+                return np.nan
+        
+        # Objective function to minimize
+        def objective(sigma):
+            if sigma <= 0:
+                return 1e10
+            try:
+                bs_price = self.black_scholes_price(S, K, T, r, sigma, option_type, q)
+                return abs(bs_price - option_price)
+            except:
+                return 1e10
+        
+        # Minimize to find IV
+        result = minimize_scalar(objective, bounds=(0.001, 5.0), method='bounded')
+        
+        if result.success and result.fun < 0.01:  # Good convergence
+            return result.x
+        else:
+            return np.nan
+    
+    def get_contract_details(self, ticker, expiration_date, strike, option_type):
+        """
+        Find the nearest available option contract
+        expiration_date: string in format 'YYYYMMDD'
+        option_type: 'C' for call, 'P' for put
+        """
+        stock = Stock(ticker, 'SMART', 'USD')
+        self.ib.qualifyContracts(stock)
+        
+        # Get option chain for the expiration date
+        chains = self.ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
+
+        print(f"chains: {chains}")
+        
+        # Find the right chain
+        target_exp = expiration_date
+        available_strikes = []
+        
+        for chain in chains:
+            if target_exp in chain.expirations:
+                available_strikes = sorted(chain.strikes)
+                break
+        
+        if not available_strikes:
+            raise ValueError(f"No options found for {ticker} expiring on {expiration_date}")
+        
+        # Find nearest strike
+        nearest_strike = min(available_strikes, key=lambda x: abs(x - strike))
+        print(f"Requested strike: {strike}, Using nearest: {nearest_strike}")
+        
+        # Create option contract
+        option = Option(ticker, expiration_date, nearest_strike, option_type, 'SMART')
+        self.ib.qualifyContracts(option)
+        
+        return option, nearest_strike
+    
+    def get_historical_data(self, contract, end_date, days_back=90, bar_size='1 day'):
+        """
+        Fetch historical data from IBKR
+        end_date: datetime object or string 'YYYYMMDD'
+        """
+        if isinstance(end_date, str):
+            end_date = datetime.strptime(end_date, '%Y%m%d')
+        
+        duration = f"{days_back} D"
+        
+        try:
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime=end_date,
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow='TRADES',
+                useRTH=True,
+                formatDate=1
+            )
             
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+            if bars:
+                df = pd.DataFrame(bars)
+                df['date'] = pd.to_datetime(df['date'])
+                return df
+            else:
+                return pd.DataFrame()
+        except Exception as e:
+            print(f"Error fetching historical data: {e}")
+            return pd.DataFrame()
     
-    if option_type == 'call':
-        price = (S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2))
-    elif option_type == 'put':
-        price = (K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1))
-    else:
-        raise ValueError("Invalid option type. Must be 'call' or 'put'.")
+    def get_stock_price_history(self, ticker, end_date, days_back=90):
+        """Get historical stock prices"""
+        stock = Stock(ticker, 'SMART', 'USD')
+        self.ib.qualifyContracts(stock)
         
-    return price
-
-def implied_volatility(market_price, S, K, T, r, option_type='call'):
-    """
-    Calculates the implied volatility using the Brentq root-finding method.
-    """
-    # Objective function: difference between market price and BS model price
-    objective_function = lambda sigma: black_scholes(S, K, T, r, sigma, option_type) - market_price
-
-    # Brentq needs a bracket [a, b] where f(a) and f(b) have opposite signs.
-    # We search for a solution between 0.01% and 500% volatility.
-    try:
-        iv = brentq(objective_function, a=1e-4, b=5.0)
-    except ValueError:
-        iv = np.nan # Return NaN if no solution is found
+        return self.get_historical_data(stock, end_date, days_back)
+    
+    def get_treasury_rate(self, date):
+        """
+        Get approximate 3-month Treasury rate for a given date
+        Uses a simplified approach - in production, fetch from FRED or similar
+        """
+        # For now, using rough approximations based on 2024-2025 rates
+        # In production, you'd fetch actual historical rates from FRED API
+        year = date.year
         
-    return iv
-
-# --- 3. Data Fetching and Analysis ---
-
-def analyze_historical_iv(ticker, expiration_date, strike, option_type):
-    """
-    Fetches historical data and calculates IV for a single option contract.
-    """
-    print(f"Fetching data for {ticker} {strike} {option_type.capitalize()} expiring {expiration_date}...")
-    
-    # Get historical stock data
-    stock_data = yf.download(ticker, start="2020-01-01", end=expiration_date, progress=False)['Adj Close']
-    
-    # Get risk-free rate (13-week Treasury Bill)
-    rf_data = yf.download('^IRX', start="2020-01-01", end=expiration_date, progress=False)['Adj Close'] / 100
-    
-    # Get historical option data
-    try:
-        hist_options = options.get_historical_option_data(ticker, expiration_date)
-        if option_type == 'call':
-            contract_data = hist_options['calls']
+        if year >= 2024:
+            return 0.045  # Approximate 4.5% for 2024-2025
+        elif year >= 2023:
+            return 0.05
+        elif year >= 2022:
+            return 0.03
         else:
-            contract_data = hist_options['puts']
+            return 0.02
         
-        # Filter for the specific strike price
-        contract_data = contract_data[contract_data['Strike'] == strike].copy()
-        if contract_data.empty:
-            print(f"Error: No historical data found for strike {strike}.")
+        # TODO: Implement actual FRED API fetch for production use
+    
+    def get_dividend_yield(self, ticker, date):
+        """
+        Estimate dividend yield at a given date
+        Simplified approach - uses recent dividend data
+        """
+        try:
+            stock = Stock(ticker, 'SMART', 'USD')
+            self.ib.qualifyContracts(stock)
+            
+            # Get fundamental data
+            fundamentals = self.ib.reqFundamentalData(stock, 'ReportSnapshot')
+            
+            # Parse dividend yield if available (simplified)
+            # In production, you'd need historical dividend data
+            return 0.01  # Default 1% if not available
+        except:
+            return 0.01  # Default assumption
+    
+    def calculate_iv_series(self, ticker, expiration_date, strike, option_type, days_back=90):
+        """
+        Main function to calculate IV over time
+        expiration_date: string 'YYYYMMDD'
+        option_type: 'call' or 'put' (will be converted to 'C' or 'P')
+        """
+        # Convert option type
+        opt_type_code = 'C' if option_type.lower() == 'call' else 'P'
+        
+        print(f"\n{'='*60}")
+        print(f"Analyzing {ticker} {option_type.upper()} option")
+        print(f"Expiration: {expiration_date}, Target Strike: {strike}")
+        print(f"{'='*60}\n")
+        
+        # Get option contract
+        option, actual_strike = self.get_contract_details(ticker, expiration_date, strike, opt_type_code)
+        
+        # Get historical option prices
+        print("Fetching historical option prices...")
+        option_hist = self.get_historical_data(option, expiration_date, days_back)
+        
+        if option_hist.empty:
+            print("No historical option data available")
             return None
-            
-    except Exception as e:
-        print(f"Error fetching historical options data: {e}")
-        return None
-
-    # Prepare data for calculation
-    contract_data['Date'] = pd.to_datetime(contract_data['Date'])
-    contract_data.set_index('Date', inplace=True)
-    
-    # Combine all data sources
-    df = pd.DataFrame(index=contract_data.index)
-    df['Option_Price'] = (contract_data['Bid'] + contract_data['Ask']) / 2 # Use midpoint price
-    df['Underlying_Price'] = stock_data
-    df['Risk_Free_Rate'] = rf_data
-    
-    # Forward fill missing stock prices and risk-free rates (for weekends/holidays)
-    df.ffill(inplace=True)
-    df.dropna(inplace=True) # Drop any remaining rows with missing data
-    
-    exp_date_obj = datetime.strptime(expiration_date, '%Y-%m-%d').date()
-    
-    # Calculate IV for each day
-    df['Time_to_Exp'] = [(exp_date_obj - idx.date()).days / 365.25 for idx in df.index]
-    
-    df['IV'] = np.vectorize(implied_volatility)(
-        df['Option_Price'],
-        df['Underlying_Price'],
-        strike,
-        df['Time_to_Exp'],
-        df['Risk_Free_Rate'],
-        option_type
-    )
-    
-    return df
-
-def analyze_volatility_smile(ticker, expiration_date, smile_date, option_type):
-    """
-    Fetches option chain for a single day to calculate the volatility smile.
-    """
-    print(f"\nFetching volatility smile data for {smile_date}...")
-    try:
-        chain = options.get_options_chain(ticker, date=smile_date)
-        if option_type == 'call':
-            df = chain['calls']
-        else:
-            df = chain['puts']
-
-        # Get data needed for IV calculation
-        stock_price = yf.Ticker(ticker).history(period='1d')['Close'].iloc[0]
-        rf_rate = yf.download('^IRX', start=smile_date, progress=False)['Close'].iloc[0] / 100
         
-        exp_date_obj = datetime.strptime(expiration_date, '%Y-%m-%d').date()
-        smile_date_obj = datetime.strptime(smile_date, '%Y-%m-%d').date()
-        time_to_exp = (exp_date_obj - smile_date_obj).days / 365.25
-
-        # Calculate IV for each strike
-        df['IV'] = df.apply(
-            lambda row: implied_volatility(
-                row['Last Price'], stock_price, row['Strike'], time_to_exp, rf_rate, option_type
-            ), axis=1
+        # Get historical stock prices
+        print("Fetching historical stock prices...")
+        stock_hist = self.get_historical_data(
+            Stock(ticker, 'SMART', 'USD'), 
+            expiration_date, 
+            days_back
         )
-        # Filter out NaN values and unrealistic IVs
-        df.dropna(subset=['IV'], inplace=True)
-        df = df[df['IV'] > 0.01]
-        return df
+        
+        if stock_hist.empty:
+            print("No historical stock data available")
+            return None
+        
+        # Merge data
+        stock_hist = stock_hist[['date', 'close']].rename(columns={'close': 'stock_price'})
+        option_hist = option_hist[['date', 'close']].rename(columns={'close': 'option_price'})
+        
+        merged = pd.merge(option_hist, stock_hist, on='date', how='inner')
+        
+        if merged.empty:
+            print("No overlapping data between option and stock prices")
+            return None
+        
+        # Calculate IV for each day
+        expiration_dt = datetime.strptime(expiration_date, '%Y%m%d')
+        
+        iv_data = []
+        for _, row in merged.iterrows():
+            date = row['date']
+            days_to_exp = (expiration_dt - date).days
+            T = days_to_exp / 365.0
+            
+            if T <= 0:
+                continue
+            
+            r = self.get_treasury_rate(date)
+            q = self.get_dividend_yield(ticker, date)
+            
+            iv = self.calculate_implied_volatility(
+                row['option_price'],
+                row['stock_price'],
+                actual_strike,
+                T,
+                r,
+                option_type.lower(),
+                q
+            )
+            
+            iv_data.append({
+                'date': date,
+                'days_to_expiration': days_to_exp,
+                'stock_price': row['stock_price'],
+                'option_price': row['option_price'],
+                'implied_volatility': iv,
+                'iv_percent': iv * 100 if not np.isnan(iv) else np.nan
+            })
+        
+        result_df = pd.DataFrame(iv_data)
+        result_df = result_df.dropna(subset=['implied_volatility'])
+        
+        print(f"\nCalculated IV for {len(result_df)} days")
+        print(f"Average IV: {result_df['iv_percent'].mean():.2f}%")
+        print(f"IV Range: {result_df['iv_percent'].min():.2f}% - {result_df['iv_percent'].max():.2f}%")
+        
+        return result_df
+    
+    def plot_iv_chart(self, iv_data, ticker, strike, expiration_date, option_type):
+        """Create visualization of IV over time"""
+        if iv_data is None or iv_data.empty:
+            print("No data to plot")
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+        
+        # Plot IV
+        ax1.plot(iv_data['date'], iv_data['iv_percent'], 
+                linewidth=2, color='blue', marker='o', markersize=4)
+        ax1.set_ylabel('Implied Volatility (%)', fontsize=12, fontweight='bold')
+        ax1.set_title(
+            f'{ticker} {option_type.upper()} Option Implied Volatility\n'
+            f'Strike: ${strike}, Expiration: {expiration_date}',
+            fontsize=14, fontweight='bold'
+        )
+        ax1.grid(True, alpha=0.3)
+        ax1.axhline(y=iv_data['iv_percent'].mean(), color='r', 
+                   linestyle='--', label=f'Average: {iv_data["iv_percent"].mean():.2f}%')
+        ax1.legend()
+        
+        # Plot stock price
+        ax2.plot(iv_data['date'], iv_data['stock_price'], 
+                linewidth=2, color='green', marker='o', markersize=4)
+        ax2.set_ylabel('Stock Price ($)', fontsize=12, fontweight='bold')
+        ax2.set_xlabel('Date', fontsize=12, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        ax2.axhline(y=strike, color='r', linestyle='--', 
+                   label=f'Strike: ${strike}')
+        ax2.legend()
+        
+        plt.tight_layout()
+        plt.xticks(rotation=45)
+        
+        return fig
 
-    except Exception as e:
-        print(f"Could not fetch volatility smile data: {e}")
-        return None
 
-# --- 4. Main Execution and Plotting ---
+def main():
+    """
+    Main execution function
+    Example usage with configurable parameters
+    """
+    
+    # CONFIGURATION
+    tickers = ["AAPL", "GOOGL", "AMZN", "META", "MSFT", "NVDA", "TSLA"]
+    
+    # Choose one ticker for this run (or loop through all)
+    ticker = "AAPL"
+    
+    # Option parameters
+    strike_price = 150  # Target strike price
+    expiration_date = "20250201"  # YYYYMMDD format
+    option_type = "call"  # 'call' or 'put'
+    
+    # Analysis parameters
+    days_back = 90  # How many days before expiration to analyze
+    
+    # IBKR connection settings
+    host = '127.0.0.1'
+    port = 7497  # 7497 for TWS paper, 7496 for TWS live, 4002 for Gateway paper, 4001 for Gateway live
+    
+    # Initialize calculator
+    calc = OptionIVCalculator(host=host, port=port)
+    
+    # Connect to IBKR
+    if not calc.connect():
+        print("Failed to connect. Please check:")
+        print("1. TWS or IB Gateway is running")
+        print("2. API connections are enabled in TWS (File -> Global Configuration -> API -> Settings)")
+        print("3. Port number is correct")
+        return
+    
+    try:
+        # Calculate IV series
+        iv_data = calc.calculate_iv_series(
+            ticker=ticker,
+            expiration_date=expiration_date,
+            strike=strike_price,
+            option_type=option_type,
+            days_back=days_back
+        )
+        
+        if iv_data is not None:
+            # Save to CSV
+            filename = f"{ticker}_{option_type}_{strike_price}_{expiration_date}_IV.csv"
+            iv_data.to_csv(filename, index=False)
+            print(f"\nData saved to {filename}")
+            
+            # Create plot
+            fig = calc.plot_iv_chart(iv_data, ticker, strike_price, 
+                                    expiration_date, option_type)
+            if fig:
+                plot_filename = f"{ticker}_{option_type}_{strike_price}_{expiration_date}_IV.png"
+                plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+                print(f"Chart saved to {plot_filename}")
+                plt.show()
+        
+    finally:
+        # Always disconnect
+        calc.disconnect()
+
 
 if __name__ == "__main__":
-    # --- Plot 1: Historical Implied Volatility ---
-    hist_df = analyze_historical_iv(TICKER, EXPIRATION_DATE, STRIKE_PRICE, OPTION_TYPE)
-    
-    if hist_df is not None and not hist_df.empty:
-        plt.style.use('seaborn-v0_8-darkgrid')
-        fig, ax1 = plt.subplots(figsize=(14, 7))
-
-        # Plot IV
-        color = 'tab:red'
-        ax1.set_xlabel('Date')
-        ax1.set_ylabel('Implied Volatility (%)', color=color)
-        ax1.plot(hist_df.index, hist_df['IV'] * 100, color=color, label='Implied Volatility')
-        ax1.tick_params(axis='y', labelcolor=color)
-        ax1.set_title(f'Historical Implied Volatility vs. Stock Price\n{TICKER} ${STRIKE_PRICE} {OPTION_TYPE.capitalize()} expiring {EXPIRATION_DATE}')
-        
-        # Plot Stock Price on a second y-axis
-        ax2 = ax1.twinx()
-        color = 'tab:blue'
-        ax2.set_ylabel('Stock Price ($)', color=color)
-        ax2.plot(hist_df.index, hist_df['Underlying_Price'], color=color, label='Stock Price')
-        ax2.tick_params(axis='y', labelcolor=color)
-
-        fig.tight_layout()
-        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-        plt.gcf().autofmt_xdate()
-        
-    # --- Plot 2: Volatility Smile ---
-    smile_df = analyze_volatility_smile(TICKER, EXPIRATION_DATE, SMILE_DATE, OPTION_TYPE)
-
-    if smile_df is not None and not smile_df.empty:
-        plt.figure(figsize=(14, 7))
-        plt.plot(smile_df['Strike'], smile_df['IV'] * 100, marker='o', linestyle='-')
-        plt.title(f'Volatility Smile for {TICKER} {OPTION_TYPE.capitalize()}s expiring {EXPIRATION_DATE}\n(Snapshot on {SMILE_DATE})')
-        plt.xlabel('Strike Price ($)')
-        plt.ylabel('Implied Volatility (%)')
-        plt.grid(True)
-
-    # Show all plots
-    if (hist_df is not None and not hist_df.empty) or \
-       (smile_df is not None and not smile_df.empty):
-        plt.show()
-    else:
-        print("\nCould not generate any plots due to data fetching errors.")
+    main()
