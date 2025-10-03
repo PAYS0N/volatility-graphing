@@ -1,32 +1,29 @@
-import requests
+import subprocess
+import json
 
-owner, repo, branch = "post-no-preference", "options", "master"
-query = """
-SELECT DISTINCT expiration
-FROM option_chain
-WHERE act_symbol = 'AAPL';
-"""
+# SQL query
+query = "SELECT DISTINCT expiration FROM option_chain WHERE act_symbol='AAPL' AND expiration BETWEEN '2025-01-29' and '2025-02-05'"
 
-res = requests.get(
-    "https://www.dolthub.com/api/v1alpha1/{}/{}/{}".format(owner, repo, branch),
-    params={"q": query},
-    headers={ "authorization": "token " },
+# Run the query using dolt sql
+print("Querying options for expiration date in week range")
+result = subprocess.run(
+    ["dolt", "sql", "-q", query, "-r", "json"],
+    capture_output=True,
+    text=True,
+    cwd="./options"  # path to your Dolt repo
 )
-if res.headers.get("Content-Type") == "application/json":
-    print(res.json())
-else:
-    print("Non-JSON response:")
-    print("Status:", res.status_code)
-    print(res.text[:500])
 
-query = """SELECT expiration 
-            FROM option_chain 
-            WHERE act_symbol = 'AAPL' 
-            AND expiration = '2025-01-29'
-            LIMIT 1;"""
+if result.returncode != 0:
+    print("Dolt failed:", result.stderr)
+    raise RuntimeError("Query failed")
 
-query = """SELECT expiration 
-        FROM option_chain 
-        WHERE act_symbol = 'AAPL' 
-        AND expiration = '2025-02-05'
-        LIMIT 1;"""
+if not result.stdout.strip():
+    raise ValueError("No output from Dolt query")
+
+print(result.stdout)
+print("Formatting output")
+# Parse JSON
+data = json.loads(result.stdout)
+# data['rows'] is a list of lists
+expiration = data['rows'][0]['expiration']
+print(expiration)
