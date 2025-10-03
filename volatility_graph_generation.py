@@ -95,7 +95,8 @@ class DoltOptionIVPlotter:
         call_put = call_put.capitalize()  # 'Call' or 'Put'
         
         print(f"Searching for nearest strike to ${strike}...")
-        actual_strike = self.find_nearest_strike(ticker, expiration_date, strike)
+        # actual_strike = self.find_nearest_strike(ticker, expiration_date, strike)
+        actual_strike = strike
         
         if actual_strike is None:
             raise ValueError(f"No options found for {ticker} expiring on {expiration_date}")
@@ -160,6 +161,17 @@ class DoltOptionIVPlotter:
                 label='Implied Volatility')
         ax1.fill_between(data['date'], data['iv_percent'], alpha=0.3, color='#2E86AB')
         
+        # Get min and max
+        min_iv = data['iv_percent'].min()
+        max_iv = data['iv_percent'].max()
+
+        # Expand range by ±5%
+        ylim_lower = min_iv - 5
+        ylim_upper = max_iv + 5
+
+        # Apply to plot
+        ax1.set_ylim(ylim_lower, ylim_upper)
+
         # Add average line
         avg_iv = data['iv_percent'].mean()
         ax1.axhline(y=avg_iv, color='#A23B72', linestyle='--', linewidth=2, 
