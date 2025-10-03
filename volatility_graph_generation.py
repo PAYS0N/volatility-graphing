@@ -10,6 +10,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import numpy as np
+import os
 
 class DoltOptionIVPlotter:
     def __init__(self, dolt_repo_path="./options"):
@@ -322,7 +323,8 @@ def main():
         print(f"  Average IV: {data['iv_percent'].mean():.2f}%")
         
         # Save to CSV
-        csv_filename = f"{ticker}_{call_put}_{actual_strike:.2f}_{expiration_date}_IV.csv"
+        csv_filename = f"./csv/{ticker}/{expiration_date}/{actual_strike:.2f}_{call_put}_IV.csv"
+        os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
         data.to_csv(csv_filename, index=False)
         print(f"\n✓ Data saved to: {csv_filename}")
         
@@ -331,7 +333,8 @@ def main():
         fig_iv = plotter.plot_iv(data, ticker, actual_strike, expiration_date, call_put)
         
         if fig_iv:
-            iv_filename = f"{ticker}_{call_put}_{actual_strike:.2f}_{expiration_date}_IV.png"
+            iv_filename = f"./graphs/{ticker}/{expiration_date}/{actual_strike:.2f}_{call_put}_IV.png"
+            os.makedirs(os.path.dirname(iv_filename), exist_ok=True)
             plt.figure(fig_iv.number)
             plt.savefig(iv_filename, dpi=300, bbox_inches='tight')
             print(f"✓ IV chart saved to: {iv_filename}")
@@ -340,7 +343,8 @@ def main():
         fig_greeks = plotter.plot_greeks(data, ticker, actual_strike, expiration_date, call_put)
         
         if fig_greeks:
-            greeks_filename = f"{ticker}_{call_put}_{actual_strike:.2f}_{expiration_date}_Greeks.png"
+            greeks_filename = f"./graphs/{ticker}/{expiration_date}/{actual_strike:.2f}_{call_put}_Greeks.png"
+            os.makedirs(os.path.dirname(greeks_filename), exist_ok=True)
             plt.figure(fig_greeks.number)
             plt.savefig(greeks_filename, dpi=300, bbox_inches='tight')
             print(f"✓ Greeks chart saved to: {greeks_filename}")
